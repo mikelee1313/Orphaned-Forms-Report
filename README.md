@@ -1,5 +1,5 @@
-# OrphanedForms-Report.ps1 — Microsoft Forms Orphan Risk Report
-This script creates an inventory report to identify Orphaned Microsoft Forms allowing Admins to restore the Form before it's permanently deleted.
+# Get-Forms-Info.ps1 — Microsoft Forms Orphan Risk Report
+
 Identifies Microsoft Forms at risk of permanent loss due to their owner's account being **soft-deleted** or **disabled** in Entra ID. Produces a CSV report with actionable recovery URLs.
 
 ## The Problem
@@ -21,6 +21,7 @@ This script mines the Microsoft Purview Unified Audit Log for Forms activity to 
 5. **Outputs two CSV files** to `$env:TEMP`:
    - `Forms-Orphan-Risk-Report-<timestamp>.csv` — prioritized report
    - `Forms-Raw-Audit-<timestamp>.csv` — raw audit events for investigation
+6. **Sends an alert email** (optional) via `Send-FormsOrphanAlertEmail` — posts an HTML summary of HIGH/Medium risk accounts to the configured recipients using the Graph `sendMail` API. Requires `$SendEmailNotifications = $true` and `Mail.Send` (Application) permission.
 
 ## Prerequisites
 
@@ -33,6 +34,7 @@ All permissions are **Application** type and require **admin consent**:
 | `AuditLogsQuery.Read.All` | Submit and read Graph Audit Log queries |
 | `User.Read.All` | Resolve live user status (active/disabled) |
 | `Directory.Read.All` | Query soft-deleted users from Entra recycle bin |
+| `Mail.Send` | Send alert email via Graph `sendMail` API (**required only when `$SendEmailNotifications = $true`**) |
 
 ### Authentication Options
 
@@ -61,6 +63,17 @@ $OutputFolder    = $env:TEMP
 ```
 
 Set `$IncludeResponseSignals = $true` to also flag users who only responded to forms (higher noise, useful for full coverage).
+
+### Email Notifications
+
+```powershell
+$SendEmailNotifications = $true            # Set $false to disable
+$EmailTo                = @('admin@contoso.com')   # Recipients (addresses or DL)
+$EmailFrom              = 'admin@contoso.com'      # Licensed EXO mailbox in the tenant
+$EmailMinRiskLevel      = 'HIGH'           # Minimum risk level to include: HIGH, Medium, or Low
+```
+
+When enabled, `Send-FormsOrphanAlertEmail` sends an HTML table of at-risk accounts sorted by urgency (days until permanent deletion) after the report is generated. Email is delivered via `POST /users/{EmailFrom}/sendMail` — no SMTP relay required. The `Mail.Send` (Application) permission must be granted on the app registration.
 
 ## Running the Script
 
