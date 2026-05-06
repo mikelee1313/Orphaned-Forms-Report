@@ -21,11 +21,13 @@
 
 .NOTES
   Requires:
-    - App registration with: AuditLogsQuery.Read.All, User.Read.All, Directory.Read.All
+    - App registration with: AuditLogsQuery.Read.All, User.Read.All, Directory.Read.All, Mail.Send
+      - Mail.Send is required only when $SendEmailNotifications = $true (used by Send-FormsOrphanAlertEmail)
     - No PowerShell modules required — all calls use Invoke-RestMethod against Graph API
 
     Created by: Mike Lee
     Created Date: 5/4/2026
+    Updated: 5/6/2026 - Added support for e-mail notifications
 
   Authentication:
     - Graph API only: client-credentials token via AcquireToken() using certificate or client secret
@@ -96,6 +98,24 @@ $MaxRetries = 15
 $InitialBackoffSec = 3
 $RequestTimeoutSec = 300
 
+# ---- Email Notifications ----
+# Set $SendEmailNotifications = $true to send an alert email after the report runs.
+# An email is sent listing all HIGH (and optionally Medium) risk orphaned Forms accounts.
+$SendEmailNotifications = $false
+
+# Recipients — individual addresses or mail-enabled group/distribution-list addresses.
+$EmailTo = @(
+    'admin@M365CPI13246019.onmicrosoft.com'
+)
+
+# Sender address — must be a licensed Exchange Online mailbox in the tenant.
+# The app registration must have Mail.Send (Application) permission granted in Entra ID.
+# Email is sent via Graph API (POST /users/{EmailFrom}/sendMail) — no SMTP relay needed.
+$EmailFrom = 'admin@M365CPI13246019.onmicrosoft.com'
+
+# Minimum risk level to include in the alert email: 'HIGH', 'Medium', or 'Low'
+$EmailMinRiskLevel = 'HIGH'
+
 ##############################################################
 #                END CONFIGURATION SECTION                   #
 ##############################################################
@@ -104,6 +124,9 @@ $RequestTimeoutSec = 300
 #region Initialization
 $global:token = $null
 $global:tokenExpiry = $null
+
+# Required for HTML-encoding display names and UPNs in alert email bodies
+Add-Type -AssemblyName System.Web
 #endregion Initialization
 
 #region Helper Functions
@@ -350,6 +373,145 @@ function Invoke-WithRetry {
 }
 
 #endregion Logging Functions
+
+#region Email Functions
+
+function Send-FormsOrphanAlertEmail {
+    <#
+    .SYNOPSIS
+        Sends an HTML alert email to the admin list ($EmailTo) summarising orphaned
+        Microsoft Forms accounts whose owners have been deleted and whose Forms are at
+        risk of permanent deletion.
+
+        Uses the Microsoft Graph API (POST /users/{EmailFrom}/sendMail) with the
+        existing bearer token — no SMTP relay required.
+        Requires $SendEmailNotifications = $true and Mail.Send (Application) on the
+        app registration.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)] [object[]] $AffectedAccounts
+    )
+
+    if ($AffectedAccounts.Count -eq 0) { return }
+
+    $subject = "[Forms Orphan Alert] $($AffectedAccounts.Count) account(s) with orphaned Forms require attention — Tenant: $script:tenantId"
+
+    # Build HTML table rows, sorted by days until permanent deletion (most urgent first)
+    $sortedAccounts = $AffectedAccounts | Sort-Object {
+        if ($null -ne $_.DaysUntilPermanentDeletion) { $_.DaysUntilPermanentDeletion } else { 999 }
+    }
+
+    $tableRows = foreach ($acct in $sortedAccounts) {
+        $daysLeft = if ($null -ne $acct.DaysUntilPermanentDeletion) { "$($acct.DaysUntilPermanentDeletion)" } else { 'N/A' }
+        $daysNum = if ($null -ne $acct.DaysUntilPermanentDeletion) { [double]$acct.DaysUntilPermanentDeletion } else { 999 }
+
+        # Row colour: red shading <= 3 days, amber <= 7 days, white otherwise
+        $rowColor = if ($daysNum -le 3) { '#fde8e8' } elseif ($daysNum -le 7) { '#fff3cd' } else { '#ffffff' }
+
+        $safeUpn = [System.Web.HttpUtility]::HtmlEncode($acct.UserPrincipalName)
+        $safeAction = [System.Web.HttpUtility]::HtmlEncode($acct.RecommendedAction)
+        $safeRisk = [System.Web.HttpUtility]::HtmlEncode($acct.RiskLevel)
+        $safeForms = [System.Web.HttpUtility]::HtmlEncode($acct.FormNames)
+
+        # Build recovery URL hyperlinks — one per form
+        $urlLinks = if ($acct.RecoveryUrls) {
+            $urls = $acct.RecoveryUrls -split ';' | Where-Object { $_ }
+            ($urls | ForEach-Object { "<a href='$_'>Recover</a>" }) -join ' | '
+        }
+        else { 'N/A' }
+
+        "<tr style='background-color:$rowColor;'>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$safeUpn</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;text-align:center;'>$safeRisk</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;text-align:center;'>$($acct.FormCount)</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$safeForms</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;text-align:center;'>$daysLeft</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$safeAction</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$urlLinks</td>
+        </tr>"
+    }
+
+    $headerColor = '#1a5276'
+    $alertHeading = "Forms Orphan Alert — $($AffectedAccounts.Count) account(s) with orphaned Forms require immediate attention"
+
+    $body = @"
+<!DOCTYPE html>
+<html>
+<body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;margin:20px;">
+  <h2 style="color:$headerColor;margin-bottom:4px;">$alertHeading</h2>
+  <p style="margin-top:0;color:#555;font-size:13px;">
+    Tenant: <strong>$script:tenantId</strong> &nbsp;|&nbsp;
+    Report date: <strong>$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</strong> &nbsp;|&nbsp;
+    Orphan window: <strong>$script:OrphanWindowDays days</strong>
+  </p>
+  <p>
+    The accounts below have been deleted and their Microsoft Forms are at risk of
+    permanent deletion when the soft-delete window expires. Please recover or transfer
+    Forms ownership immediately using the recovery links provided.
+  </p>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;">
+    <thead>
+      <tr style="background-color:$headerColor;color:#fff;">
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">User (UPN)</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:center;">Risk</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:center;">Form Count</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">Form Names</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:center;">Days Until Permanent Deletion</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">Recommended Action</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">Recovery Links</th>
+      </tr>
+    </thead>
+    <tbody>
+      $($tableRows -join "`n      ")
+    </tbody>
+  </table>
+  <br/>
+  <p style="font-size:12px;color:#888;">
+    Full report saved to: $script:reportCsv<br/>
+    Generated by OrphanedForms-Report.ps1
+  </p>
+</body>
+</html>
+"@
+
+    # Build the Graph sendMail payload.
+    # toRecipients is constructed from the $EmailTo array — each address becomes
+    # a separate emailAddress object so both individual mailboxes and mail-enabled
+    # groups are handled correctly.
+    $toRecipients = @($script:EmailTo | ForEach-Object {
+            @{ emailAddress = @{ address = $_ } }
+        })
+
+    $graphMailBody = @{
+        message         = @{
+            subject      = $subject
+            body         = @{ contentType = 'HTML'; content = $body }
+            toRecipients = $toRecipients
+        }
+        saveToSentItems = $false
+    } | ConvertTo-Json -Depth 6 -Compress
+
+    # The sender mailbox must match $EmailFrom. With app-only auth the call is
+    # POST /users/{sender}/sendMail — /me is not valid for client-credentials tokens.
+    $sendUri = "https://graph.microsoft.com/v1.0/users/$([Uri]::EscapeDataString($script:EmailFrom))/sendMail"
+
+    Test-ValidToken
+    $headers = @{ Authorization = "Bearer $global:token" }
+
+    try {
+        Invoke-GraphRequestWithThrottleHandling -Uri $sendUri -Method POST -Headers $headers `
+            -Body $graphMailBody -ContentType 'application/json'
+        Write-Log INFO "Forms orphan alert email sent to: $($script:EmailTo -join ', ')"
+    }
+    catch {
+        Write-Log ERROR "Forms orphan alert email send failed: $($_.Exception.Message)"
+        Write-Host "  Verify: Mail.Send (Application) is granted for app '$script:clientId' in Entra ID." -ForegroundColor Yellow
+        Write-Host "  Sender mailbox '$script:EmailFrom' must be a licensed Exchange Online mailbox." -ForegroundColor Yellow
+    }
+}
+
+#endregion Email Functions
 
 #region User Resolution
 
@@ -776,5 +938,30 @@ Write-Log INFO "Raw audit export written: $eventsCsv"
 Write-Log INFO "Done."
 
 #endregion Output
+
+#region Email Notifications
+if ($SendEmailNotifications) {
+    Write-Log INFO "Sending Forms orphan alert email..."
+
+    # Filter report rows by the configured minimum risk level
+    $riskOrder = @{ 'HIGH' = 1; 'Medium' = 2; 'Low' = 3 }
+    $minRank = if ($riskOrder.ContainsKey($EmailMinRiskLevel)) { $riskOrder[$EmailMinRiskLevel] } else { 1 }
+
+    $emailCandidates = @($report | Where-Object {
+            $riskOrder.ContainsKey($_.RiskLevel) -and $riskOrder[$_.RiskLevel] -le $minRank
+        })
+
+    if ($emailCandidates.Count -gt 0) {
+        Write-Log INFO "  $($emailCandidates.Count) account(s) meet the '$EmailMinRiskLevel' threshold — sending alert."
+        Send-FormsOrphanAlertEmail -AffectedAccounts $emailCandidates
+    }
+    else {
+        Write-Log INFO "  No accounts meet the '$EmailMinRiskLevel' risk threshold — email skipped."
+    }
+}
+else {
+    Write-Log INFO "Email notifications skipped (`$SendEmailNotifications = `$false)."
+}
+#endregion Email Notifications
 
 #endregion Script Execution
